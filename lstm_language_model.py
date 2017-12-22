@@ -69,15 +69,13 @@ class LanguageModel(object):
                       dtype=tf.float32)
     return inputs_batch, labels_batch
 
-  def inference(self, inputs_batch):
+  def inference(self, inputs_batch, keep_prob):
     inputs = tf.nn.embedding_lookup(self.embedding, inputs_batch)
-    if self.is_training and self.config.keep_prob < 1:
-      inputs = tf.nn.dropout(inputs, self.config.keep_prob)
+    inputs = tf.nn.dropout(inputs, keep_prob)
 
     def make_cell(s):
       cell = tf.contrib.rnn.LSTMBlockCell(s, forget_bias=0.0)
-      if self.is_training and self.config.keep_prob < 1:
-        cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=self.config.keep_prob)
+      cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=keep_prob)
       return cell
 
     sizes = [self.config.embedding_size] * self.config.num_layers
@@ -113,10 +111,10 @@ class LanguageModel(object):
                         global_step=tf.train.get_or_create_global_step())
     return train_op
 
-  def update_lr(self, session, update_op, new_lr, lr_value):
+  def assign_lr(self, session, update_op, new_lr, lr_value):
     session.run(update_op, feed_dict={new_lr: lr_value})
 
-  def run_epoch(self, sess, total_loss, df, inputs_batch, labels_batch,  eval_op=None):
+  def run_epoch(self, sess, total_loss, df, inputs_batch, labels_batch, keep_prob, eval_op=None):
     costs = 0.0
     iters = 0
     state = sess.run(self.initial_state)
@@ -134,6 +132,7 @@ class LanguageModel(object):
 
       feed_dict[inputs_batch] = inputs_batch_val
       feed_dict[labels_batch] = labels_batch_val
+      feed_dict[keep_prob] = self.config.keep_prob
 
       vals = sess.run(fetches, feed_dict)
       cost = vals["cost"]
@@ -149,29 +148,30 @@ class LanguageModel(object):
 
   def build_graph(self):
     inputs_batch, labels_batch = self.create_variables()
-    logits_batch = self.inference(inputs_batch)
+    keep_prob = tf.placeholder(dtype=tf.float32, shape=[])
+    logits_batch = self.inference(inputs_batch, keep_prob)
     total_loss = self.loss(logits_batch, labels_batch)
     lr, new_lr, update_op = self.get_learning_rate()
     train_op = self.get_train_op(total_loss, lr)
 
-    out_list = [total_loss, inputs_batch, labels_batch]
+    out_list = [total_loss, inputs_batch, labels_batch, keep_prob]
     if self.is_training:
       out_list.extend([train_op, lr, new_lr, update_op])
     return out_list
 
   def train(self, df, sess):
-    total_loss, inputs_batch, labels_batch, train_op, lr, new_lr, update_op = self.build_graph()
+    total_loss, inputs_batch, labels_batch, keep_prob, train_op, lr, new_lr, update_op = self.build_graph()
     sess.run(tf.global_variables_initializer())
-
+    print("aaaaaaa")
     for i in xrange(self.config.max_max_epoch):
       lr_decay = self.config.lr_decay ** max(i + 1 - self.config.max_epoch, 0.0)
-      self.update_lr(sess, update_op, new_lr, self.config.init_lr * lr_decay)
+      self.assign_lr(sess, update_op, new_lr, self.config.init_lr * lr_decay)
       print("Epoch: %d Learning rate: %.3f" % (i + 1, sess.run(lr)))
 
-      train_perplexity = self.run_epoch(sess, total_loss, df, inputs_batch, labels_batch, train_op)
+      train_perplexity = self.run_epoch(sess, total_loss, df, inputs_batch, labels_batch, keep_prob, train_op)
       print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
 
   def score(self, df, sess):
-    total_loss, inputs_batch, labels_batch = self.build_graph()
-    perplexity = self.run_epoch(sess, total_loss, df, inputs_batch, labels_batch)
+    total_loss, inputs_batch, labels_batch, keep_prob = self.build_graph()
+    perplexity = self.run_epoch(sess, total_loss, df, inputs_batch, labels_batch, keep_prob)
     return perplexity
