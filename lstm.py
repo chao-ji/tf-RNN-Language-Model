@@ -51,6 +51,44 @@ class DataFeeder(object):
       yield x, y
 
 
+class MyBasicLSTMCell(tf.contrib.rnn.RNNCell):
+  """
+  Subclassing `tf.contrib.rnn.RNNCell` and implementing `call`
+  """
+  def __init__(self, num_units, forget_bias=1.0, activation=None, reuse=None):
+    super(MyBasicLSTMCell, self).__init__(_reuse=reuse)
+
+    self._num_units = num_units
+    self._forget_bias = forget_bias
+    self._activation = activation or tf.tanh
+
+  def call(self, inputs, state):
+    c, h = state
+    inputs_and_state = tf.concat([inputs, h], axis=1)
+
+    self._weights = tf.get_variable("lstm_kernel", [inputs_and_state.get_shape()[1], 4 * self._num_units],
+        dtype=tf.float32)
+    self._biases = tf.get_variable("lstm_bias", [4 * self._num_units], dtype=tf.float32,
+        initializer=tf.constant_initializer(value=0.0, dtype=tf.float32))
+
+    logits = tf.matmul(inputs_and_state, self._weights) + self._biases
+    i, j, f, o = tf.split(value=logits, num_or_size_splits=4, axis=1)
+
+    new_c = c * tf.sigmoid(f + self._forget_bias) + tf.sigmoid(i) * self._activation(j)
+    new_h = self._activation(new_c) * tf.sigmoid(o)
+
+    new_state = tf.contrib.rnn.LSTMStateTuple(new_c, new_h)
+    return new_h, new_state
+
+  @property
+  def state_size(self):
+    return tf.contrib.rnn.LSTMStateTuple(self._num_units, self._num_units)
+
+  @property
+  def output_size(self):
+    return self._num_units 
+
+
 class LanguageModel(object):
   def __init__(self, is_training, df, config):
     self.is_training = is_training
@@ -74,7 +112,8 @@ class LanguageModel(object):
     inputs = tf.nn.dropout(inputs, keep_prob)
 
     def make_cell(s):
-      cell = tf.contrib.rnn.LSTMBlockCell(s, forget_bias=0.0)
+#      cell = tf.contrib.rnn.BasicLSTMCell(s, forget_bias=0.0)
+      cell = MyBasicLSTMCell(s, forget_bias=0.0)
       cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=keep_prob)
       return cell
 
@@ -85,6 +124,8 @@ class LanguageModel(object):
     outputs = tf.reshape(outputs, [-1, self.config.embedding_size])
     logits_batch = tf.nn.xw_plus_b(outputs, self.softmax_w, self.softmax_b)
     logits_batch = tf.reshape(logits_batch, [self.config.batch_size, self.config.num_steps, self.config.vocab_size])
+
+    self.cell = multi_rnn_cell
     return logits_batch
 
   def loss(self, logits_batch, labels_batch):
