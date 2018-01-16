@@ -1,53 +1,52 @@
-import os
 import collections
 
 import tensorflow as tf
 import numpy as np
 
 class DataFeeder(object):
-  def __init__(self, config, filename, vocab=None):
+  def __init__(self, batch_size, num_steps, filename, vocab=None):
+    self.batch_size = batch_size
+    self.num_steps = num_steps
+    self.filename = filename 
     self.vocab = vocab
-    self.raw_data = np.array(self.get_raw_data(filename))
-    self.config = config
-    self.epoch_size = ((len(self.raw_data) // self.config.batch_size) - 1) // self.config.num_steps
 
-  def read_words(self, filename):
+  def _read_words(self, filename):
     with open(filename) as f:
       words = f.read().replace("\n", "<eos>").split()
     return words
 
-  def file2ids(self, filename, word2id):
-    words = self.read_words(filename)
-    return [word2id[word] for word in words if word in word2id]
+  def _file_to_word_ids(self, filename, vocab):
+    words = self._read_words(filename)
+    return [vocab[word] for word in words if word in vocab]
 
-  def build_vocab(self, filename):
-    words = self.read_words(filename)
+  def _build_vocab(self, filename):
+    words = self._read_words(filename)
     counter = collections.Counter(words)
-    pairs = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
-    words_sorted, _ = list(zip(*pairs))
+    word_count_pairs_sorted = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
+    words_sorted, _ = list(zip(*word_count_pairs_sorted))
     vocab = dict(zip(words_sorted, range(len(words_sorted))))
     return vocab
 
   def get_raw_data(self, filename):
     if self.vocab is None:
-      self.vocab = self.build_vocab(filename)
-    raw_data = self.file2ids(filename, self.vocab)
+      self.vocab = self._build_vocab(filename)
+    raw_data = self._file_to_word_ids(filename, self.vocab)
     return raw_data
 
   def batch_generator(self):
-    raw_data = self.raw_data
-    batch_size = self.config.batch_size
-    num_steps = self.config.num_steps
-    epoch_size = self.epoch_size
-    batch_len = self.raw_data.shape[0] // self.config.batch_size
-    data = raw_data[:batch_size*batch_len].reshape((batch_size, batch_len))
+    if not hasattr(self, "raw_data"):
+      self.raw_data = np.array(self.get_raw_data(self.filename))
 
-    if epoch_size <= 0:
-      raise ValueError("epoch_size == 0, decrease batch_size or num_steps")
+      self.batch_len = len(self.raw_data) / self.batch_size
+      self.epoch_size = (self.batch_len - 1) / self.num_steps
+      self.data = self.raw_data[:self.batch_size*self.batch_len].reshape((self.batch_size, self.batch_len))
 
-    for i in xrange(epoch_size):
-      x = data[:batch_size, i*num_steps:(i+1)*num_steps]
-      y = data[:batch_size, i*num_steps+1:(i+1)*num_steps+1]
+      if self.epoch_size <= 0:
+        raise ValueError("epoch_size == 0, decrease batch_size or num_steps")
+
+    for i in xrange(self.epoch_size):
+      x = self.data[:self.batch_size, i*self.num_steps:(i+1)*self.num_steps]
+      y = self.data[:self.batch_size, i*self.num_steps+1:(i+1)*self.num_steps+1]
       yield x, y
 
 
@@ -66,13 +65,13 @@ class MyBasicLSTMCell(tf.contrib.rnn.RNNCell):
     c, h = state
     inputs_and_state = tf.concat([inputs, h], axis=1)
 
-    self._weights = tf.get_variable("lstm_kernel", [inputs_and_state.get_shape()[1], 4 * self._num_units],
+    self._weights = tf.get_variable("lstm_kernel", [inputs_and_state.get_shape()[1], 4*self._num_units],
         dtype=tf.float32)
-    self._biases = tf.get_variable("lstm_bias", [4 * self._num_units], dtype=tf.float32,
+    self._biases = tf.get_variable("lstm_bias", [4*self._num_units], dtype=tf.float32,
         initializer=tf.constant_initializer(value=0.0, dtype=tf.float32))
 
-    logits = tf.matmul(inputs_and_state, self._weights) + self._biases
-    i, j, f, o = tf.split(value=logits, num_or_size_splits=4, axis=1)
+    affined = tf.matmul(inputs_and_state, self._weights) + self._biases
+    i, j, f, o = tf.split(value=affined, num_or_size_splits=4, axis=1)
 
     new_c = c * tf.sigmoid(f + self._forget_bias) + tf.sigmoid(i) * self._activation(j)
     new_h = self._activation(new_c) * tf.sigmoid(o)
@@ -90,129 +89,168 @@ class MyBasicLSTMCell(tf.contrib.rnn.RNNCell):
 
 
 class LanguageModel(object):
-  def __init__(self, is_training, df, config):
-    self.is_training = is_training
-    self.df = df
-    self.config = config
+  """
+  N: batch_size
+  T: max_time
+  D: embedding_size
+  L: num_layers
+  V: vocab_size
+  """
+  def __init__(self,
+                init_scale=0.1,
+                init_lr=1.0,
+                max_grad_norm=5.,
+                num_layers=2,
+                num_steps=20,
+                embedding_size=200,
+                hidden_sizes=(200, 200),
+                max_epoch=4,
+                max_max_epoch=13,
+                keep_prob=1.0,
+                lr_decay=0.5,
+                batch_size=20,
+                vocab_size=10000):
+    self.init_scale = init_scale
+    self.init_lr = init_lr
+    self.max_grad_norm = max_grad_norm
+    self.num_layers = num_layers
+    self.num_steps = num_steps
+    self.embedding_size = embedding_size
+    self.hidden_sizes = hidden_sizes
+    self.max_epoch = max_epoch
+    self.max_max_epoch = max_max_epoch
+    self.keep_prob = keep_prob
+    self.lr_decay = lr_decay
+    self.batch_size = batch_size
+    self.vocab_size = vocab_size
+    
+    self._initializer = tf.random_uniform_initializer(-self.init_scale, self.init_scale)
 
-  def create_variables(self):
-    inputs_batch = tf.placeholder(dtype=tf.int64, shape=[self.config.batch_size, self.config.num_steps])
-    labels_batch = tf.placeholder(dtype=tf.int64, shape=[self.config.batch_size, self.config.num_steps])
-
-    self.embedding = tf.get_variable("embedding", shape=[self.config.vocab_size,
-                      self.config.embedding_size], dtype=tf.float32)
-    self.softmax_w = tf.get_variable("softmax_w", shape=[self.config.embedding_size,
-                      self.config.vocab_size], dtype=tf.float32)
-    self.softmax_b = tf.get_variable("softmax_b", shape=[self.config.vocab_size],
-                      dtype=tf.float32)
+  def _get_placeholders(self, batch_shape):
+    inputs_batch = tf.placeholder(dtype=tf.int64, shape=batch_shape, name="inputs_batch")
+    labels_batch = tf.placeholder(dtype=tf.int64, shape=batch_shape, name="labels_batch")
+    if not hasattr(self, "_keep_prob"):
+      self._keep_prob = tf.placeholder(dtype=tf.float32, shape=[], name="keep_prob")
+    if not hasattr(self, "new_lr"):
+      self.new_lr = tf.placeholder(dtype=tf.float32, shape=[], name="new_learning_rate")
     return inputs_batch, labels_batch
 
-  def inference(self, inputs_batch, keep_prob):
-    inputs = tf.nn.embedding_lookup(self.embedding, inputs_batch)
-    inputs = tf.nn.dropout(inputs, keep_prob)
+  def _get_variables(self):
+    embedding = tf.get_variable("embedding", shape=[self.vocab_size,
+      self.embedding_size], dtype=tf.float32)
+    softmax_w = tf.get_variable("softmax_w", shape=[self.embedding_size,
+      self.vocab_size], dtype=tf.float32)
+    softmax_b = tf.get_variable("softmax_b", shape=[self.vocab_size],
+      dtype=tf.float32)
+    self.lr = tf.get_variable("learning_rate", shape=[], dtype=tf.float32,
+      trainable=False)
+    return embedding, softmax_w, softmax_b
 
-    def make_cell(s):
-#      cell = tf.contrib.rnn.BasicLSTMCell(s, forget_bias=0.0)
-      cell = MyBasicLSTMCell(s, forget_bias=0.0)
-      cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=keep_prob)
+  def inference(self, embedding, softmax_w, softmax_b, inputs_batch, batch_shape):
+    batch_size, num_steps = batch_shape
+    # [N, T, D]
+    inputs = tf.nn.embedding_lookup(embedding, inputs_batch)
+    inputs = tf.nn.dropout(inputs, self._keep_prob)
+    def make_cell(size):
+      cell = MyBasicLSTMCell(size)
+      cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=self._keep_prob)
       return cell
-
-    sizes = [self.config.embedding_size] * self.config.num_layers
-    multi_rnn_cell = tf.contrib.rnn.MultiRNNCell([make_cell(s) for s in sizes], state_is_tuple=True)
-    self.initial_state = multi_rnn_cell.zero_state(self.config.batch_size, tf.float32)
-    outputs, self.final_state = tf.nn.dynamic_rnn(multi_rnn_cell, inputs, initial_state=self.initial_state)
-    outputs = tf.reshape(outputs, [-1, self.config.embedding_size])
-    logits_batch = tf.nn.xw_plus_b(outputs, self.softmax_w, self.softmax_b)
-    logits_batch = tf.reshape(logits_batch, [self.config.batch_size, self.config.num_steps, self.config.vocab_size])
-
+    multi_rnn_cell = tf.contrib.rnn.MultiRNNCell([make_cell(size) 
+      for size in self.hidden_sizes], state_is_tuple=True)
+    # [LSTMStateTuple(c=Tensor(shape=[N, D]), h=Tensor(shape=[N, D]))] * L
+    initial_state = multi_rnn_cell.zero_state(batch_size, tf.float32)
+    # [N, T, D]; [LSTMStateTuple(c=Tensor(shape=[N, D]), h=Tensor(shape=[N, D]))] * L
+    outputs, final_state = tf.nn.dynamic_rnn(multi_rnn_cell, inputs, initial_state=initial_state)
+    # [N*T, D] 
+    outputs = tf.reshape(outputs, [-1, self.embedding_size])
+    # [N*T, V]
+    logits_batch = tf.matmul(outputs, softmax_w) + softmax_b
+    # [N, T, V]
+    logits_batch = tf.reshape(logits_batch, [batch_size, num_steps, self.vocab_size])
     self.cell = multi_rnn_cell
-    return logits_batch
+    return logits_batch, initial_state, final_state 
 
-  def loss(self, logits_batch, labels_batch):
+  def build_graph(self, inputs_batch, labels_batch, batch_shape):
+    with tf.variable_scope("Model", reuse=tf.AUTO_REUSE, initializer=self._initializer):
+      embedding, softmax_w, softmax_b = self._get_variables()
+      logits_batch, initial_state, final_state = self.inference(embedding, 
+        softmax_w, softmax_b, inputs_batch, batch_shape)
+
     loss = tf.contrib.seq2seq.sequence_loss(
-        logits_batch,
-        labels_batch,
-        tf.ones([self.config.batch_size, self.config.num_steps], dtype=tf.float32),
+        logits=logits_batch,
+        targets=labels_batch,
+        weights=tf.ones(batch_shape, dtype=tf.float32),
         average_across_timesteps=False,
-        average_across_batch=True) 
-    return tf.reduce_sum(loss)
-    
-  def get_learning_rate(self):
-    lr = tf.Variable(0.0, trainable=False)
-    new_lr = tf.placeholder(tf.float32, shape=[], name="new_learning_rate")
-    update_op = tf.assign(lr, new_lr)
-    return lr, new_lr, update_op
+        average_across_batch=True)
+    return tf.reduce_sum(loss), initial_state, final_state
 
-  def get_train_op(self, total_loss, lr):
-    trainable_vars = tf.trainable_variables() 
-    grads, _ = tf.clip_by_global_norm(tf.gradients(total_loss, trainable_vars),
-                                      self.config.max_grad_norm)
-    optimizer = tf.train.GradientDescentOptimizer(lr)
-    train_op = optimizer.apply_gradients(zip(grads, trainable_vars),
+  def _get_train_step(self, loss):
+    trainable_vars = tf.trainable_variables()
+    grads, _ = tf.clip_by_global_norm(tf.gradients(loss, trainable_vars),
+                                      self.max_grad_norm)
+    optimizer = tf.train.GradientDescentOptimizer(self.lr)
+    train_step = optimizer.apply_gradients(zip(grads, trainable_vars),
                         global_step=tf.train.get_or_create_global_step())
-    return train_op
+    return train_step
 
-  def assign_lr(self, session, update_op, new_lr, lr_value):
-    session.run(update_op, feed_dict={new_lr: lr_value})
+  def _do_update_lr(self, sess, lr_val):
+    sess.run(tf.assign(self.lr, self.new_lr), feed_dict={self.new_lr: lr_val})
 
-  def run_epoch(self, sess, total_loss, df, inputs_batch, labels_batch, keep_prob, eval_op=None):
+  def run_epoch(self, sess, loss, data_feeder, inputs_batch, labels_batch, 
+      keep_prob, num_steps, initial_state, final_state, test_mode=False, train_step=None):
     costs = 0.0
     iters = 0
-    state = sess.run(self.initial_state)
-    g = df.batch_generator()
-    fetches = {"cost": total_loss, "final_state": self.final_state}
+    state = sess.run(initial_state)
+    g = data_feeder.batch_generator()
+    fetches = {"cost": loss, "final_state": final_state}
 
-    if eval_op is not None:
-      fetches["eval_op"] = eval_op
+    if train_step is not None:
+      fetches["train_step"] = train_step
 
     for step, (inputs_batch_val, labels_batch_val) in enumerate(g):
       feed_dict = {}
-      for i, (c, h) in enumerate(self.initial_state):
+      for i, (c, h) in enumerate(initial_state):
         feed_dict[c] = state[i].c
         feed_dict[h] = state[i].h
 
       feed_dict[inputs_batch] = inputs_batch_val
       feed_dict[labels_batch] = labels_batch_val
-      feed_dict[keep_prob] = self.config.keep_prob
+      feed_dict[self._keep_prob] = keep_prob
 
       vals = sess.run(fetches, feed_dict)
       cost = vals["cost"]
       state = vals["final_state"]
 
       costs += cost
-      iters += self.config.num_steps
+      iters += num_steps
 
-      if self.is_training and step % (df.epoch_size // 10) == 10:
-        print("%.3f perplexity: %.3f" % (step * 1.0 / df.epoch_size, np.exp(costs / iters)))
+      if not test_mode and step % (data_feeder.epoch_size // 10) == 10:
+        print("%.3f perplexity: %.3f" % (step * 1.0 / data_feeder.epoch_size, np.exp(costs / iters)))
 
     return np.exp(costs / iters)
 
-  def build_graph(self):
-    inputs_batch, labels_batch = self.create_variables()
-    keep_prob = tf.placeholder(dtype=tf.float32, shape=[])
-    logits_batch = self.inference(inputs_batch, keep_prob)
-    total_loss = self.loss(logits_batch, labels_batch)
-    lr, new_lr, update_op = self.get_learning_rate()
-    train_op = self.get_train_op(total_loss, lr)
-
-    out_list = [total_loss, inputs_batch, labels_batch, keep_prob]
-    if self.is_training:
-      out_list.extend([train_op, lr, new_lr, update_op])
-    return out_list
-
-  def train(self, df, sess):
-    total_loss, inputs_batch, labels_batch, keep_prob, train_op, lr, new_lr, update_op = self.build_graph()
+  def train(self, data_feeder, sess):
+    batch_shape = self.batch_size, self.num_steps
+    with tf.name_scope("Train_graph"):
+      inputs_batch, labels_batch = self._get_placeholders(batch_shape)
+      loss, initial_state, final_state = self.build_graph(inputs_batch, labels_batch, batch_shape)
+    with tf.name_scope("train_step"):
+      train_step = self._get_train_step(loss)
     sess.run(tf.global_variables_initializer())
-    print("aaaaaaa")
-    for i in xrange(self.config.max_max_epoch):
-      lr_decay = self.config.lr_decay ** max(i + 1 - self.config.max_epoch, 0.0)
-      self.assign_lr(sess, update_op, new_lr, self.config.init_lr * lr_decay)
-      print("Epoch: %d Learning rate: %.3f" % (i + 1, sess.run(lr)))
 
-      train_perplexity = self.run_epoch(sess, total_loss, df, inputs_batch, labels_batch, keep_prob, train_op)
+    for i in xrange(self.max_max_epoch):
+      lr_decay = self.lr_decay ** max(i + 1 - self.max_epoch, 0.0)
+      self._do_update_lr(sess, self.init_lr * lr_decay)
+      print("Epoch: %d Learning rate: %.3f" % (i + 1, sess.run(self.lr)))
+      train_perplexity = self.run_epoch(sess, loss, data_feeder, inputs_batch, labels_batch,
+        self.keep_prob, self.num_steps, initial_state, final_state, False, train_step)
       print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
 
-  def score(self, df, sess):
-    total_loss, inputs_batch, labels_batch, keep_prob = self.build_graph()
-    perplexity = self.run_epoch(sess, total_loss, df, inputs_batch, labels_batch, keep_prob)
+  def score(self, data_feeder, sess):
+    batch_shape = 1, 1
+    with tf.name_scope("Test_graph"):
+      inputs_batch, labels_batch = self._get_placeholders(batch_shape)
+      loss, initial_state, final_state = self.build_graph(inputs_batch, labels_batch, batch_shape)
+    perplexity = self.run_epoch(sess, loss, data_feeder, inputs_batch, labels_batch, 1.0, 1, 
+      initial_state, final_state, True)
     return perplexity
