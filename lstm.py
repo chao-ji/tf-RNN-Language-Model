@@ -89,13 +89,7 @@ class MyBasicLSTMCell(tf.contrib.rnn.RNNCell):
 
 
 class LanguageModel(object):
-  """
-  N: batch_size
-  T: max_time
-  D: embedding_size
-  L: num_layers
-  V: vocab_size
-  """
+  """Word-based Language Model"""
   def __init__(self,
                 init_scale=0.1,
                 init_lr=1.0,
@@ -196,16 +190,17 @@ class LanguageModel(object):
   def _do_update_lr(self, sess, lr_val):
     sess.run(tf.assign(self.lr, self.new_lr), feed_dict={self.new_lr: lr_val})
 
-  def run_epoch(self, sess, loss, data_feeder, inputs_batch, labels_batch, 
-      keep_prob, num_steps, initial_state, final_state, test_mode=False, train_step=None):
-    costs = 0.0
-    iters = 0
-    state = sess.run(initial_state)
-    g = data_feeder.batch_generator()
-    fetches = {"cost": loss, "final_state": final_state}
+  def run_epoch(self, data_feeder, graph, params, sess, train_step=None):
+    loss, inputs_batch, labels_batch, initial_state, final_state = graph
+    keep_prob, num_steps = params
+    _test_mode = train_step is None
 
-    if train_step is not None:
-      fetches["train_step"] = train_step
+    total_loss, total_len, state = 0., 0, sess.run(initial_state)
+    g = data_feeder.batch_generator()
+
+    to_be_run = {"loss": loss, "final_state": final_state}
+    if not _test_mode:
+      to_be_run["train_step"] = train_step
 
     for step, (inputs_batch_val, labels_batch_val) in enumerate(g):
       feed_dict = {}
@@ -217,17 +212,16 @@ class LanguageModel(object):
       feed_dict[labels_batch] = labels_batch_val
       feed_dict[self._keep_prob] = keep_prob
 
-      vals = sess.run(fetches, feed_dict)
-      cost = vals["cost"]
-      state = vals["final_state"]
+      to_be_run_val = sess.run(to_be_run, feed_dict)
+      loss, state = to_be_run_val["loss"], to_be_run_val["final_state"]
 
-      costs += cost
-      iters += num_steps
+      total_loss += loss
+      total_len += num_steps
 
-      if not test_mode and step % (data_feeder.epoch_size // 10) == 10:
-        print("%.3f perplexity: %.3f" % (step * 1.0 / data_feeder.epoch_size, np.exp(costs / iters)))
-
-    return np.exp(costs / iters)
+      if not _test_mode and step % (data_feeder.epoch_size / 10) == 0:
+        print("%.3f perplexity: %.3f" % (step * 1.0 / data_feeder.epoch_size, 
+                                          np.exp(total_loss / total_len)))
+    return np.exp(total_loss / total_len)
 
   def train(self, data_feeder, sess):
     batch_shape = self.batch_size, self.num_steps
@@ -242,8 +236,9 @@ class LanguageModel(object):
       lr_decay = self.lr_decay ** max(i + 1 - self.max_epoch, 0.0)
       self._do_update_lr(sess, self.init_lr * lr_decay)
       print("Epoch: %d Learning rate: %.3f" % (i + 1, sess.run(self.lr)))
-      train_perplexity = self.run_epoch(sess, loss, data_feeder, inputs_batch, labels_batch,
-        self.keep_prob, self.num_steps, initial_state, final_state, False, train_step)
+      graph = loss, inputs_batch, labels_batch, initial_state, final_state
+      params = self.keep_prob, self.num_steps
+      train_perplexity = self.run_epoch(data_feeder, graph, params, sess, train_step)
       print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
 
   def score(self, data_feeder, sess):
@@ -251,6 +246,46 @@ class LanguageModel(object):
     with tf.name_scope("Test_graph"):
       inputs_batch, labels_batch = self._get_placeholders(batch_shape)
       loss, initial_state, final_state = self.build_graph(inputs_batch, labels_batch, batch_shape)
-    perplexity = self.run_epoch(sess, loss, data_feeder, inputs_batch, labels_batch, 1.0, 1, 
-      initial_state, final_state, True)
+    graph = loss, inputs_batch, labels_batch, initial_state, final_state
+    params = 1.0, 1
+    perplexity = self.run_epoch(data_feeder, graph, params, sess)
     return perplexity
+
+  def generate(self, seed_words, vocab, index2word, exclude_ids, length, sess):
+    batch_shape = 1, 1
+    seed_ids = np.array([vocab[word] for word in seed_words if word in vocab])
+    word_ids = np.arange(len(vocab))
+    gen_ids = [seed_ids[0]]
+    feed_dict = {self._keep_prob: 1.0}
+
+    with tf.name_scope("Generate_graph"):
+      inputs_batch, _ = self._get_placeholders(batch_shape)
+      with tf.variable_scope("Model", reuse=tf.AUTO_REUSE):
+        embedding, softmax_w, softmax_b = self._get_variables()
+        logits_batch, initial_state, final_state = self.inference(embedding,
+          softmax_w, softmax_b, inputs_batch, batch_shape)
+    
+    state_val = sess.run(initial_state)
+
+    for i in xrange(1, len(seed_ids) + length):
+      feed_dict[inputs_batch] = np.array(gen_ids[-1]).reshape(batch_shape)
+      for l, (c, h) in enumerate(initial_state):
+        feed_dict[c] = state_val[l].c
+        feed_dict[h] = state_val[l].h
+      logits_batch_val, state_val = sess.run([logits_batch, final_state], feed_dict)
+      next_id = seed_ids[i] if i < len(seed_ids) else \
+        self._sample_next_id(word_ids, logits_batch_val[0, 0], exclude_ids)
+      gen_ids.append(next_id)
+
+    return [index2word[id_] if id_ != 2 else "." for id_ in gen_ids]
+
+  def _sample_next_id(self, word_ids, logits, exclude_ids):
+    while True:
+      id_ = np.random.choice(word_ids, p=self._softmax(logits))
+      if id_ not in exclude_ids:
+        return id_
+
+  def _softmax(self, x):
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum()
+       
