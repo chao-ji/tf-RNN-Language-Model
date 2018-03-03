@@ -1,68 +1,126 @@
-from language_model import *
+import os
 
-train_path = "/home/user/Desktop/lstm_language_model/simple-examples/data/ptb.train.txt"
-valid_path = "/home/user/Desktop/lstm_language_model/simple-examples/data/ptb.valid.txt"
-test_path = "/home/user/Desktop/lstm_language_model/simple-examples/data/ptb.test.txt"
+import data
+import model
+import model_runner
 
-class WordLevel(object):
-  init_scale = 0.1
-  init_lr = 1.0
-  max_grad_norm = 5.
-  num_layers = 2
-  num_steps = 20
-  embedding_size = 200
-  hidden_sizes = (200, 200)
-  max_epoch = 4
-  max_max_epoch = 13
-  keep_prob = 1.0
-  lr_decay = 0.5
-  batch_size = 20
-  vocab_size = 10000
-
-class CharLevel(object):
-  init_scale = 0.1
-  init_lr = 0.1
-  max_grad_norm = 5.
-  num_layers = 2
-  num_steps = 40
-  embedding_size = 100
-  hidden_sizes=(100, 100)
-  max_epoch = 4
-  max_max_epoch = 13
-  keep_prob = 1.0
-  lr_decay = 0.5
-  batch_size = 20
-  vocab_size = 50
+import numpy as np
+import tensorflow as tf
 
 
-config = WordLevel()
+word_level = False
+num_steps = 50
+num_units = 128 
+vocab_size = 50
+lr = 0.1
 
-train_df = DataFeeder(batch_size=config.batch_size, num_steps=config.num_steps, filename=train_path, word_level=True)
+hparams = tf.contrib.training.HParams(
+  word_level=word_level,
+  file_data = "/home/chaoji/Desktop/lstm_language_model/simple-examples/data/ptb.train.txt",
+  file_vocab = "/home/chaoji/Desktop/lstm_language_model/simple-examples/data/ptb.train.txt",
+
+  unit_type = "lstm",
+  forget_bias = 1.0,
+  init_scale = 0.1,
+  lr = lr,
+  max_grad_norm = 5.,
+  num_layers = 2,
+  num_steps = num_steps,
+  num_units = num_units,
+  max_epoch = 4,
+  max_max_epoch = 13,
+  dropout = 0.0,
+  lr_decay = 0.5,
+  batch_size = 20,
+  vocab_size = vocab_size)
+
+hparams_eval = tf.contrib.training.HParams(
+  word_level=word_level,
+  file_data = "/home/chaoji/Desktop/lstm_language_model/simple-examples/data/ptb.test.txt",
+  file_vocab = "/home/chaoji/Desktop/lstm_language_model/simple-examples/data/ptb.train.txt",
+
+  unit_type = "lstm",
+  forget_bias = 1.0,
+  init_scale = 0.1,
+  num_layers = 2,
+  num_steps = num_steps,
+  num_units = num_units,
+  dropout = 0.0,
+  batch_size = 20,
+  vocab_size = vocab_size)
+
+hparams_infer = tf.contrib.training.HParams(
+  word_level=word_level,
+  file_vocab = "/home/chaoji/Desktop/lstm_language_model/simple-examples/data/ptb.train.txt", 
+  unit_type = "lstm",
+  forget_bias = 1.0,
+  init_scale = 0.1,
+  num_layers = 2,
+  num_units = num_units,
+  dropout = 0.0,
+  vocab_size = vocab_size)
 
 
-lm = RNNLanguageModel( init_scale=config.init_scale,
-                    init_lr=config.init_lr,
-                    max_grad_norm=config.max_grad_norm,
-                    num_layers=config.num_layers,
-                    num_steps=config.num_steps,
-                    embedding_size=config.embedding_size,
-                    hidden_sizes=config.hidden_sizes,
-                    max_epoch=config.max_epoch,
-                    max_max_epoch=config.max_max_epoch,
-                    keep_prob=config.keep_prob,
-                    lr_decay=config.lr_decay,
-                    batch_size=config.batch_size,
-                    vocab_size=config.vocab_size,
-                    cell_type="lstm")
+def train_epoch(hparams, trainer, train_sess, i):
+  trainer.dataset.init_iterator(train_sess)
 
-lm.train(train_df)
+  state_val = model_runner.compute_init_state(trainer, train_sess)
+  total_loss = 0.0
+  total_word_count = 0.0
 
-test_df = DataFeeder(batch_size=1, num_steps=1, filename=test_path, word_level=True, vocab=train_df.vocab)
-p = lm.score(test_df)
+  trainer.update_iter_steps(train_sess, i)
+  while True:
+    try:
+      loss, state_val, lr = trainer.train(train_sess, hparams, state_val)
 
-#exclude_ids = set([])
-exclude_ids = set([1])
-primer = ["the", "meaning", "of", "life", "is"]
-#primer = "it seems that"
-gen_ids = lm.generate(primer, train_df.vocab, exclude_ids, 100)
-gen_words = [train_df.index2item[id_] for id_ in gen_ids]
+      total_loss += loss
+      total_word_count += hparams.num_steps
+    except tf.errors.OutOfRangeError:
+      train_ppl = np.exp(total_loss / total_word_count)
+      print("epoch: %d, train ppl: %.2f, lr: %f" % (i, train_ppl, lr))
+      break
+  return train_ppl
+
+def eval_epoch(hparams, evaluator, eval_sess, i):
+  evaluator.dataset.init_iterator(eval_sess)
+
+  state_val = model_runner.compute_init_state(evaluator, eval_sess)
+  total_loss = 0.0
+  total_word_count = 0.0
+
+  while True:
+    try:
+      loss, state_val = evaluator.eval(eval_sess, hparams, state_val)
+
+      total_loss += loss
+      total_word_count += hparams.num_steps
+    except tf.errors.OutOfRangeError:
+      eval_ppl = np.exp(total_loss / total_word_count)
+      print("epoch: %d, eval ppl: %.2f" % (i, eval_ppl))
+      break
+  return eval_ppl
+
+
+ckpt = "/home/chaoji/Dropbox/tensorflow/rnn_language_model/"
+
+builder = model.RNNLanguageModel
+trainer = model_runner.RNNLanguageModelTrainer(builder, hparams)
+evaluator = model_runner.RNNLanguageModelEvaluator(builder, hparams_eval)
+
+train_sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True), graph=trainer.graph)
+eval_sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True), graph=evaluator.graph)
+
+trainer.restore_params_from(train_sess, ckpt)
+
+for i in range(13):
+  train_ppl = train_epoch(hparams, trainer, train_sess, i)
+  trainer.persist_params_to(train_sess, os.path.join(ckpt, "lm"))
+
+  evaluator.restore_params_from(eval_sess, ckpt)
+  eval_ppl = eval_epoch(hparams_eval, evaluator, eval_sess, i)
+  print
+
+generator = model_runner.SequenceGenerator(builder, hparams_infer)
+with tf.Session(graph=generator.graph) as sess:
+  generator.restore_params_from(sess, ckpt)
+  a = generator.generate_text(sess, hparams_infer, "It seems that", 20, set([1]))
