@@ -1,7 +1,7 @@
 r"""Executable for training language model.
 
 Example:
-  python run_evaluation.py \
+  python run_training.py \
       --filenames=/PATH/TO/FILENAMES \
       --vocab_filenames=/PATH/TO/VOCAB_FILENAMES \ 
       --ckpt_path=/PATH/TO/CKPT

@@ -1,4 +1,4 @@
-r"""Executable for evaluation a trained language model.
+r"""Executable for evaluating a trained language model.
 
 Example:
   python run_evaluation.py \
