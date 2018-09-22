@@ -4,7 +4,9 @@ Example:
   python run_evaluation.py \
       --filenames=/PATH/TO/FILENAMES \
       --vocab_filenames=/PATH/TO/VOCAB_FILENAMES \ 
-      --ckpt_path=/PATH/TO/CKPT
+      --ckpt_path=/PATH/TO/CKPT_FILE
+
+The generated sequences will be printed to stdout.
 """
 import tensorflow as tf
 import numpy as np

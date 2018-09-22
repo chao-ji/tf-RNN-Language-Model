@@ -2,8 +2,8 @@ r"""Executable for sequence generation.
 
 Example:
   python run_generator.py \
-    --primer_file/PATH/TO/PRIMER_FILE 
-    --vocab_filenames=/PATH/TO/VOCAB_FILENAMES
+    --primer_file=/PATH/TO/PRIMER_FILE \
+    --vocab_filenames=/PATH/TO/VOCAB_FILENAMES \
     --ckpt_path=/PATH/TO/CKPT
 
 """
