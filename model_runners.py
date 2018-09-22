@@ -157,7 +157,7 @@ class RNNLanguageModelSeqGenerator(object):
     Returns:
       to_be_run_dict: dict mapping from names to tensors/operations, holding
         the following entries:
-        { 'gen_seq': int tensor of shape [gen_seq_len] }
+        { 'gen_seq': 1-D string tensor of shape [gen_seq_len] }
     """
     return self._generate_basic(filename, dataset)
 
